@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
@@ -21,6 +22,7 @@ import usb.core
 from PIL import Image, ImageDraw, ImageTk
 
 from ax206 import AX206, AX206Error
+import widget_claude
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
@@ -69,6 +71,15 @@ def lcd_call(fn):
                     _lcd = None
                 if attempt == 2:
                     raise
+                # um comando interrompido no meio deixa o firmware fora de
+                # sincronia; so um reset USB completo recupera
+                try:
+                    dev = usb.core.find(idVendor=0x1908, idProduct=0x0102)
+                    if dev is not None:
+                        dev.reset()
+                except usb.core.USBError:
+                    pass
+                time.sleep(2)  # re-enumeracao
 
 
 def send_pil_image(img, brightness=None):
@@ -221,6 +232,8 @@ class App:
         self.ox = self.oy = 0.0  # canto sup. esquerdo do recorte, em px da imagem
         self._drag_start = None
         self._send_job = None
+        self._widget_stop = threading.Event()
+        self._widget_thread = None
 
         root.title("GPU Screen — AX206")
         root.resizable(False, False)
@@ -251,6 +264,9 @@ class App:
             row=1, column=1, sticky="ew", pady=2)
         ttk.Button(main, text="Padrao de teste", command=self.send_test).grid(
             row=2, column=1, sticky="ew", pady=2)
+        self.widget_button = ttk.Button(main, text="Widget Claude",
+                                        command=self.toggle_widget)
+        self.widget_button.grid(row=8, column=1, sticky="ew", pady=2)
 
         # brilho
         bright_row = ttk.Frame(main)
@@ -425,6 +441,7 @@ class App:
         if not path:
             return
         self.stop_slideshow()
+        self.stop_widget()
         try:
             self.img = Image.open(path).convert("RGB")
         except OSError as e:
@@ -442,6 +459,7 @@ class App:
         if not rgb:
             return
         self.stop_slideshow()
+        self.stop_widget()
         self.img = None
         rgb = tuple(int(c) for c in rgb)
         img = Image.new("RGB", (AX206.WIDTH, AX206.HEIGHT), rgb)
@@ -451,6 +469,7 @@ class App:
 
     def send_test(self):
         self.stop_slideshow()
+        self.stop_widget()
         self.img = None
         img = Image.new("RGB", (AX206.WIDTH, AX206.HEIGHT))
         colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
@@ -490,6 +509,7 @@ class App:
             messagebox.showwarning("Slideshow", "Escolha uma pasta valida.")
             return
         interval = max(2, self.ss_interval.get())
+        self.stop_widget()
         self._persist(mode="slideshow", slideshow_folder=folder,
                       slideshow_interval=interval)
         self.img = None
@@ -511,6 +531,51 @@ class App:
             except OSError:
                 pass
         self.root.after(0, update)
+
+    # ----- widget Claude -----
+
+    @property
+    def widget_running(self):
+        return self._widget_thread is not None and self._widget_thread.is_alive()
+
+    def toggle_widget(self):
+        if self.widget_running:
+            self.stop_widget()
+            return
+        self.start_widget()
+
+    def start_widget(self):
+        self.stop_slideshow()
+        self.img = None
+        self._widget_stop.clear()
+
+        def send_full(img):
+            lcd_call(lambda lcd: lcd.show_image(img))
+
+        def send_region(x, y, img):
+            data = AX206.image_to_rgb565(img)
+            lcd_call(lambda lcd: lcd.blit(x, y, img.width, img.height, data))
+
+        loop = widget_claude.WidgetLoop(send_full, send_region)
+
+        def worker():
+            try:
+                loop.run(self._widget_stop.is_set)
+            except (AX206Error, usb.core.USBError) as e:
+                self.root.after(0, lambda: self.set_status(f"Widget parou: {e}"))
+
+        self._widget_thread = threading.Thread(target=worker, daemon=True)
+        self._widget_thread.start()
+        self._persist(mode="widget")
+        self.widget_button.config(text="Parar widget")
+        self.set_status("Widget Claude rodando (surf, bola e soneca)")
+
+    def stop_widget(self):
+        self._widget_stop.set()
+        if self._widget_thread:
+            self._widget_thread.join(timeout=2)
+            self._widget_thread = None
+        self.widget_button.config(text="Widget Claude")
 
     def toggle_autostart(self):
         try:
@@ -559,6 +624,7 @@ class App:
 
     def quit(self):
         self.stop_slideshow()
+        self.stop_widget()
         if self.tray_icon:
             self.tray_icon.stop()
         self.root.destroy()
@@ -569,9 +635,12 @@ def main():
     root = tk.Tk()
     app = App(root, start_hidden=restore)
     if restore:
-        threading.Thread(
-            target=restore_state, args=(app.cfg, app.slideshow), daemon=True
-        ).start()
+        if app.cfg.get("mode") == "widget":
+            root.after(500, app.start_widget)
+        else:
+            threading.Thread(
+                target=restore_state, args=(app.cfg, app.slideshow), daemon=True
+            ).start()
     root.mainloop()
 
 
