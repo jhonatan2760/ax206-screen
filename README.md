@@ -33,10 +33,14 @@ Bulk-Only (CBW/CSW). Sub-comandos usados:
 ## Suíte de configuração (GUI)
 
 ```
-python suite.py
+pythonw suite.py
 ```
 
-- Enviar imagem com preview, cor sólida e padrão de teste
+(`pythonw` abre sem janela de terminal; com `python` normal também funciona)
+
+- Enviar imagem com preview fiel da telinha e enquadramento por mouse
+  (arrastar posiciona, roda do mouse dá zoom, duplo clique reseta)
+- Cor sólida e padrão de teste
 - Slider de brilho (0-7)
 - Slideshow de uma pasta com intervalo configurável
 - Minimiza para a bandeja do sistema

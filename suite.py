@@ -1,8 +1,9 @@
 """
 Suite de configuracao da telinha AX206 do suporte de GPU.
 
-Janela para enviar imagem, ajustar brilho, cor solida, slideshow de pasta,
-minimizar para a bandeja e iniciar com o Windows restaurando o ultimo estado.
+Janela para enviar imagem com posicionamento por mouse (arrastar/zoom),
+brilho, cor solida, slideshow de pasta, bandeja do sistema e iniciar
+com o Windows restaurando o ultimo estado.
 
 Uso:
   python suite.py            # abre a janela
@@ -13,10 +14,10 @@ import json
 import os
 import sys
 import threading
-import time
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
+import usb.core
 from PIL import Image, ImageDraw, ImageTk
 
 from ax206 import AX206, AX206Error
@@ -25,6 +26,8 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "AX206Screen"
+
+PREVIEW_W, PREVIEW_H = 180, 240  # preview na mesma proporcao 240x320
 
 
 # ---------- estado / config ----------
@@ -42,19 +45,30 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 
-# ---------- acesso a tela (abre por operacao, evita conflito) ----------
+# ---------- acesso a tela: conexao unica com reconexao ----------
 
+_lcd = None
 _lcd_lock = threading.Lock()
 
 
 def lcd_call(fn):
-    """Abre a tela, executa fn(lcd) e fecha. Serializado por lock."""
+    """Executa fn(lcd) na conexao persistente; reconecta uma vez se falhar."""
+    global _lcd
     with _lcd_lock:
-        lcd = AX206()
-        try:
-            return fn(lcd)
-        finally:
-            del lcd
+        for attempt in (1, 2):
+            try:
+                if _lcd is None:
+                    _lcd = AX206()
+                return fn(_lcd)
+            except (usb.core.USBError, AX206Error):
+                if _lcd is not None:
+                    try:
+                        _lcd.close()
+                    except usb.core.USBError:
+                        pass
+                    _lcd = None
+                if attempt == 2:
+                    raise
 
 
 def send_pil_image(img, brightness=None):
@@ -99,7 +113,7 @@ class Slideshow:
     def __init__(self):
         self._stop = threading.Event()
         self._thread = None
-        self.on_frame = None  # callback(caminho) p/ atualizar preview
+        self.on_frame = None
 
     @property
     def running(self):
@@ -138,8 +152,8 @@ class Slideshow:
                     send_pil_image(Image.open(path))
                     if self.on_frame:
                         self.on_frame(path)
-                except (AX206Error, OSError):
-                    pass  # tela ocupada ou arquivo invalido: tenta o proximo
+                except (AX206Error, usb.core.USBError, OSError):
+                    pass
                 if self._stop.wait(interval):
                     return
 
@@ -154,12 +168,41 @@ def restore_state(cfg, slideshow):
         if mode == "slideshow" and cfg.get("slideshow_folder"):
             slideshow.start(cfg["slideshow_folder"], cfg.get("slideshow_interval", 10))
         elif mode == "image" and cfg.get("last_image"):
-            send_pil_image(Image.open(cfg["last_image"]))
+            img = Image.open(cfg["last_image"]).convert("RGB")
+            view = cfg.get("view")
+            if view:
+                img = compose_view(img, view["scale"], view["ox"], view["oy"])
+            send_pil_image(img)
         elif mode == "fill" and cfg.get("fill_color"):
             r, g, b = cfg["fill_color"]
             send_pil_image(Image.new("RGB", (AX206.WIDTH, AX206.HEIGHT), (r, g, b)))
-    except (AX206Error, OSError):
+    except (AX206Error, usb.core.USBError, OSError):
         pass
+
+
+# ---------- composicao do enquadramento ----------
+
+def cover_scale(img):
+    """Menor escala que cobre a tela inteira (sem sobra preta)."""
+    return max(AX206.WIDTH / img.width, AX206.HEIGHT / img.height)
+
+
+def clamp_view(img, scale, ox, oy):
+    """Garante que o recorte fica dentro da imagem."""
+    crop_w = AX206.WIDTH / scale
+    crop_h = AX206.HEIGHT / scale
+    ox = max(0.0, min(ox, img.width - crop_w))
+    oy = max(0.0, min(oy, img.height - crop_h))
+    return ox, oy
+
+
+def compose_view(img, scale, ox, oy):
+    """Recorta (ox,oy) com zoom `scale` e devolve a imagem final 240x320."""
+    crop_w = AX206.WIDTH / scale
+    crop_h = AX206.HEIGHT / scale
+    ox, oy = clamp_view(img, scale, ox, oy)
+    box = (int(ox), int(oy), int(ox + crop_w), int(oy + crop_h))
+    return img.crop(box).resize((AX206.WIDTH, AX206.HEIGHT), Image.LANCZOS)
 
 
 # ---------- GUI ----------
@@ -172,6 +215,13 @@ class App:
         self.slideshow.on_frame = self._on_slideshow_frame
         self.tray_icon = None
 
+        # estado do editor de enquadramento
+        self.img = None          # imagem original (RGB)
+        self.scale = 1.0         # zoom atual (px da tela por px da imagem)
+        self.ox = self.oy = 0.0  # canto sup. esquerdo do recorte, em px da imagem
+        self._drag_start = None
+        self._send_job = None
+
         root.title("GPU Screen — AX206")
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
@@ -179,14 +229,23 @@ class App:
         main = ttk.Frame(root, padding=12)
         main.grid()
 
-        # preview
-        self.preview = tk.Canvas(main, width=180, height=240, bg="#111",
-                                 highlightthickness=1, highlightbackground="#888")
-        self.preview.grid(row=0, column=0, rowspan=8, padx=(0, 14))
+        # preview interativo
+        left = ttk.Frame(main)
+        left.grid(row=0, column=0, rowspan=9, padx=(0, 14), sticky="n")
+        self.preview = tk.Canvas(left, width=PREVIEW_W, height=PREVIEW_H,
+                                 bg="#111", highlightthickness=1,
+                                 highlightbackground="#888", cursor="fleur")
+        self.preview.pack()
+        ttk.Label(left, text="arraste p/ mover\nroda do mouse p/ zoom\nduplo clique p/ resetar",
+                  foreground="#777", justify="center").pack(pady=(4, 0))
         self._preview_img = None
+        self.preview.bind("<ButtonPress-1>", self._drag_begin)
+        self.preview.bind("<B1-Motion>", self._drag_move)
+        self.preview.bind("<MouseWheel>", self._wheel)
+        self.preview.bind("<Double-Button-1>", self._reset_view)
 
-        # imagem
-        ttk.Button(main, text="Enviar imagem...", command=self.pick_image).grid(
+        # acoes
+        ttk.Button(main, text="Abrir imagem...", command=self.pick_image).grid(
             row=0, column=1, sticky="ew", pady=2)
         ttk.Button(main, text="Cor solida...", command=self.pick_color).grid(
             row=1, column=1, sticky="ew", pady=2)
@@ -198,10 +257,10 @@ class App:
         bright_row.grid(row=3, column=1, sticky="ew", pady=(10, 2))
         ttk.Label(bright_row, text="Brilho").pack(side="left")
         self.brightness = tk.IntVar(value=self.cfg.get("brightness", 7))
-        self.bright_scale = ttk.Scale(
-            bright_row, from_=0, to=7, orient="horizontal",
-            variable=self.brightness, command=self._brightness_dragged)
-        self.bright_scale.pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Scale(bright_row, from_=0, to=7, orient="horizontal",
+                  variable=self.brightness,
+                  command=self._brightness_dragged).pack(
+            side="left", fill="x", expand=True, padx=6)
         self.bright_label = ttk.Label(bright_row, text=str(self.brightness.get()))
         self.bright_label.pack(side="left")
 
@@ -235,14 +294,15 @@ class App:
             row=7, column=1, sticky="w")
 
         self.status = ttk.Label(main, text="", foreground="#555")
-        self.status.grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.status.grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         self._draw_placeholder()
+        self._load_saved_image()
         if start_hidden:
             root.withdraw()
             self._make_tray()
 
-    # ----- helpers -----
+    # ----- infra -----
 
     def set_status(self, text):
         self.status.config(text=text)
@@ -252,28 +312,108 @@ class App:
             try:
                 fn()
                 self.root.after(0, lambda: self.set_status(done_msg))
-            except AX206Error as e:
-                self.root.after(0, lambda: messagebox.showerror("Tela", str(e)))
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Erro", str(e)))
+            except (AX206Error, usb.core.USBError) as e:
+                msg = str(e) or "Falha na comunicacao USB (tela ocupada?)"
+                self.root.after(0, lambda: self.set_status(f"Erro: {msg}"))
         threading.Thread(target=worker, daemon=True).start()
-
-    def _draw_placeholder(self):
-        img = Image.new("RGB", (180, 240), (25, 25, 30))
-        d = ImageDraw.Draw(img)
-        d.text((90, 120), "sem imagem", fill=(120, 120, 130), anchor="mm")
-        self._set_preview(img)
-
-    def _set_preview(self, pil_img):
-        pil_img = pil_img.copy()
-        pil_img.thumbnail((180, 240))
-        self._preview_img = ImageTk.PhotoImage(pil_img)
-        self.preview.delete("all")
-        self.preview.create_image(90, 120, image=self._preview_img)
 
     def _persist(self, **kw):
         self.cfg.update(kw)
         save_config(self.cfg)
+
+    # ----- preview / editor de enquadramento -----
+
+    def _draw_placeholder(self):
+        img = Image.new("RGB", (PREVIEW_W, PREVIEW_H), (25, 25, 30))
+        d = ImageDraw.Draw(img)
+        d.text((PREVIEW_W // 2, PREVIEW_H // 2), "sem imagem",
+               fill=(120, 120, 130), anchor="mm")
+        self._show_on_canvas(img)
+
+    def _show_on_canvas(self, pil_img):
+        pil_img = pil_img.resize((PREVIEW_W, PREVIEW_H))
+        self._preview_img = ImageTk.PhotoImage(pil_img)
+        self.preview.delete("all")
+        self.preview.create_image(PREVIEW_W // 2, PREVIEW_H // 2,
+                                  image=self._preview_img)
+
+    def _load_saved_image(self):
+        path = self.cfg.get("last_image")
+        if self.cfg.get("mode") == "image" and path and os.path.exists(path):
+            try:
+                self.img = Image.open(path).convert("RGB")
+                view = self.cfg.get("view")
+                if view:
+                    self.scale = view["scale"]
+                    self.ox, self.oy = view["ox"], view["oy"]
+                else:
+                    self._center_cover()
+                self._refresh_preview()
+            except OSError:
+                self.img = None
+
+    def _center_cover(self):
+        self.scale = cover_scale(self.img)
+        self.ox = (self.img.width - AX206.WIDTH / self.scale) / 2
+        self.oy = (self.img.height - AX206.HEIGHT / self.scale) / 2
+
+    def _refresh_preview(self):
+        if self.img is None:
+            return
+        self.ox, self.oy = clamp_view(self.img, self.scale, self.ox, self.oy)
+        self._show_on_canvas(compose_view(self.img, self.scale, self.ox, self.oy))
+
+    def _schedule_send(self):
+        """Envia pra tela 500ms depois da ultima interacao."""
+        if self._send_job:
+            self.root.after_cancel(self._send_job)
+        self._send_job = self.root.after(500, self._send_current_view)
+
+    def _send_current_view(self):
+        self._send_job = None
+        if self.img is None:
+            return
+        final = compose_view(self.img, self.scale, self.ox, self.oy)
+        self._persist(mode="image",
+                      view={"scale": self.scale, "ox": self.ox, "oy": self.oy})
+        self._run_bg(lambda: send_pil_image(final), "Enviado")
+
+    def _drag_begin(self, ev):
+        self._drag_start = (ev.x, ev.y, self.ox, self.oy)
+
+    def _drag_move(self, ev):
+        if self.img is None or self._drag_start is None:
+            return
+        x0, y0, ox0, oy0 = self._drag_start
+        # preview -> tela: PREVIEW_W/AX206.WIDTH; tela -> imagem: 1/scale
+        px_to_img = (AX206.WIDTH / PREVIEW_W) / self.scale
+        self.ox = ox0 - (ev.x - x0) * px_to_img
+        self.oy = oy0 - (ev.y - y0) * px_to_img
+        self._refresh_preview()
+        self._schedule_send()
+
+    def _wheel(self, ev):
+        if self.img is None:
+            return
+        factor = 1.1 if ev.delta > 0 else 1 / 1.1
+        new_scale = self.scale * factor
+        min_s = cover_scale(self.img)
+        new_scale = max(min_s, min(new_scale, min_s * 8))
+        # zoom centrado no ponto do mouse
+        img_x = self.ox + (ev.x / PREVIEW_W) * (AX206.WIDTH / self.scale)
+        img_y = self.oy + (ev.y / PREVIEW_H) * (AX206.HEIGHT / self.scale)
+        self.scale = new_scale
+        self.ox = img_x - (ev.x / PREVIEW_W) * (AX206.WIDTH / self.scale)
+        self.oy = img_y - (ev.y / PREVIEW_H) * (AX206.HEIGHT / self.scale)
+        self._refresh_preview()
+        self._schedule_send()
+
+    def _reset_view(self, _ev=None):
+        if self.img is None:
+            return
+        self._center_cover()
+        self._refresh_preview()
+        self._schedule_send()
 
     # ----- acoes -----
 
@@ -285,24 +425,33 @@ class App:
         if not path:
             return
         self.stop_slideshow()
-        img = Image.open(path)
-        self._set_preview(img)
-        self._persist(mode="image", last_image=path)
-        self._run_bg(lambda: send_pil_image(img), f"Imagem enviada: {os.path.basename(path)}")
+        try:
+            self.img = Image.open(path).convert("RGB")
+        except OSError as e:
+            messagebox.showerror("Imagem", str(e))
+            return
+        self._center_cover()
+        self._persist(mode="image", last_image=path,
+                      view={"scale": self.scale, "ox": self.ox, "oy": self.oy})
+        self._refresh_preview()
+        self._send_current_view()
+        self.set_status(f"{os.path.basename(path)} — ajuste com o mouse")
 
     def pick_color(self):
         rgb, _hex = colorchooser.askcolor(title="Cor solida")
         if not rgb:
             return
         self.stop_slideshow()
+        self.img = None
         rgb = tuple(int(c) for c in rgb)
         img = Image.new("RGB", (AX206.WIDTH, AX206.HEIGHT), rgb)
-        self._set_preview(img)
+        self._show_on_canvas(img)
         self._persist(mode="fill", fill_color=list(rgb))
         self._run_bg(lambda: send_pil_image(img), f"Cor {_hex} enviada")
 
     def send_test(self):
         self.stop_slideshow()
+        self.img = None
         img = Image.new("RGB", (AX206.WIDTH, AX206.HEIGHT))
         colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
                   (255, 0, 255), (0, 255, 255), (255, 255, 255), (0, 0, 0)]
@@ -310,13 +459,12 @@ class App:
         band = AX206.WIDTH // len(colors)
         for i, c in enumerate(colors):
             d.rectangle((i * band, 0, (i + 1) * band - 1, AX206.HEIGHT), fill=c)
-        self._set_preview(img)
+        self._show_on_canvas(img)
         self._run_bg(lambda: send_pil_image(img), "Padrao de teste enviado")
 
-    def _brightness_dragged(self, _value):
-        v = int(float(_value))
+    def _brightness_dragged(self, value):
+        v = int(float(value))
         self.bright_label.config(text=str(v))
-        # aplica ao soltar? aplica com debounce simples
         if getattr(self, "_bright_job", None):
             self.root.after_cancel(self._bright_job)
         self._bright_job = self.root.after(300, self._apply_brightness)
@@ -325,8 +473,8 @@ class App:
         self._bright_job = None
         v = self.brightness.get()
         self._persist(brightness=v)
-        self._run_bg(lambda: lcd_call(lambda lcd: lcd.set_brightness(v)),
-                     f"Brilho: {v}")
+        msg = "Brilho: 0 (tela apagada)" if v == 0 else f"Brilho: {v}"
+        self._run_bg(lambda: lcd_call(lambda lcd: lcd.set_brightness(v)), msg)
 
     def pick_folder(self):
         folder = filedialog.askdirectory(title="Pasta do slideshow")
@@ -344,6 +492,7 @@ class App:
         interval = max(2, self.ss_interval.get())
         self._persist(mode="slideshow", slideshow_folder=folder,
                       slideshow_interval=interval)
+        self.img = None
         self.slideshow.start(folder, interval)
         self.ss_button.config(text="Parar slideshow")
         self.set_status("Slideshow rodando")
@@ -356,7 +505,8 @@ class App:
     def _on_slideshow_frame(self, path):
         def update():
             try:
-                self._set_preview(Image.open(path))
+                img = Image.open(path).convert("RGB")
+                self._show_on_canvas(compose_view(img, cover_scale(img), 0, 0))
                 self.set_status(f"Slideshow: {os.path.basename(path)}")
             except OSError:
                 pass

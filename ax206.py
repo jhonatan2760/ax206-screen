@@ -55,6 +55,10 @@ class AX206:
             raise AX206Error("Endpoints bulk nao encontrados.")
         self._tag = 0
 
+    def close(self):
+        """Libera a interface USB para outros processos/instancias."""
+        usb.util.dispose_resources(self.dev)
+
     # ---- camada mass-storage (CBW/CSW) ----
 
     def _scsi_cmd(self, cmd16, data_out=None, read_len=0):
