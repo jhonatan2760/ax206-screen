@@ -1,0 +1,77 @@
+{
+  "display": { "width": 240, "height": 320, "orientation": "portrait", "color_format": "RGB565", "bit_depth": { "r": 5, "g": 6, "b": 5 }, "viewing_distance_cm": 40, "min_stroke_px": 2, "min_font_px": 14, "body_font_px": 18, "mount": "GPU support bracket" },
+  "refresh_budget": { "small_region": "30-60 fps", "region_220x160": "~8 fps", "full_frame": "~3 fps", "strategy": "per-rectangle dirty updates; static layers pushed once" },
+  "palette": {
+    "bg_graphite": { "hex": "#101418", "rgb565": "0x1082" },
+    "bg_ai_green": { "hex": "#0c100e", "rgb565": "0x0841" },
+    "bg_idle": { "hex": "#0e0d14", "rgb565": "0x0862" },
+    "panel_line": { "hex": "#2a3040", "rgb565": "0x2986" },
+    "neon_green": { "hex": "#73ba00", "rgb565": "0x75c0" },
+    "neon_bright": { "hex": "#a5ff18", "rgb565": "0xa7e3" },
+    "rt_purple": { "hex": "#b54dff", "rgb565": "0xb27f" },
+    "rt_purple_lt": { "hex": "#c98cff", "rgb565": "0xcc7f" },
+    "term_green": { "hex": "#29ff7b", "rgb565": "0x2fef" },
+    "term_dim": { "hex": "#109e4a", "rgb565": "0x14e9" },
+    "amber": { "hex": "#ffb200", "rgb565": "0xfd80" },
+    "amber_bright": { "hex": "#ffcb42", "rgb565": "0xfe48" },
+    "scanner_cyan": { "hex": "#42e3ff", "rgb565": "0x471f" },
+    "crab_orange": { "hex": "#ff7918", "rgb565": "0xfbc3" },
+    "crab_dark": { "hex": "#c64900", "rgb565": "0xc240" },
+    "crab_highlight": { "hex": "#ffb25a", "rgb565": "0xfd8b" },
+    "crab_shadow": { "hex": "#7b2c00", "rgb565": "0x7940" },
+    "red_alert": { "hex": "#ff3831", "rgb565": "0xf9c6" },
+    "text": { "hex": "#f7f3f7", "rgb565": "0xf7be" },
+    "text_dim": { "hex": "#9ca2b5", "rgb565": "0x9d16" },
+    "coral_claude": { "hex": "#c9694a", "rgb565": "0xcb49" }
+  },
+  "badges": {
+    "size": [106, 30],
+    "style": "skewed two-tone (skewX -13deg): name slab + ON/OFF state slab, accent diagonal divider",
+    "text_on": { "green_purple": "#f7f3f7", "amber": "#241800" },
+    "border": { "active": "family color", "inactive": "#3a4150" },
+    "states": ["active", "inactive"],
+    "items": [
+      { "id": "rtx_on", "label": "RTX", "family": "NVIDIA", "color": "#73ba00", "note": "RTX pipeline enable", "asset_active": "badge_rtx_on_on.rgb565", "asset_inactive": "badge_rtx_on_off.rgb565" },
+      { "id": "dlss4", "label": "DLSS 4", "family": "NVIDIA", "color": "#73ba00", "note": "AI upscaling / frame-gen", "asset_active": "badge_dlss4_on.rgb565", "asset_inactive": "badge_dlss4_off.rgb565" },
+      { "id": "ray_tracing", "label": "RAY TRACING", "family": "RT", "color": "#b54dff", "note": "Hardware ray tracing", "asset_active": "badge_ray_tracing_on.rgb565", "asset_inactive": "badge_ray_tracing_off.rgb565" },
+      { "id": "path_tracing", "label": "PATH TRACING", "family": "RT", "color": "#b54dff", "note": "Full path tracing", "asset_active": "badge_path_tracing_on.rgb565", "asset_inactive": "badge_path_tracing_off.rgb565" },
+      { "id": "reflex", "label": "REFLEX", "family": "NVIDIA", "color": "#73ba00", "note": "Low-latency mode", "asset_active": "badge_reflex_on.rgb565", "asset_inactive": "badge_reflex_off.rgb565" },
+      { "id": "gsync", "label": "G-SYNC", "family": "NVIDIA", "color": "#73ba00", "note": "Adaptive sync", "asset_active": "badge_gsync_on.rgb565", "asset_inactive": "badge_gsync_off.rgb565" },
+      { "id": "cuda", "label": "CUDA", "family": "NVIDIA", "color": "#73ba00", "note": "Compute enable", "asset_active": "badge_cuda_on.rgb565", "asset_inactive": "badge_cuda_off.rgb565" },
+      { "id": "hdr", "label": "HDR", "family": "AMD", "color": "#ffb200", "note": "High dynamic range", "asset_active": "badge_hdr_on.rgb565", "asset_inactive": "badge_hdr_off.rgb565" },
+      { "id": "fsr3", "label": "FSR 3", "family": "AMD", "color": "#ffb200", "note": "AMD upscaling", "asset_active": "badge_fsr3_on.rgb565", "asset_inactive": "badge_fsr3_off.rgb565" },
+      { "id": "vcache", "label": "3D V-CACHE", "family": "AMD", "color": "#ffb200", "note": "AMD stacked cache", "asset_active": "badge_vcache_on.rgb565", "asset_inactive": "badge_vcache_off.rgb565" },
+      { "id": "ryzen", "label": "RYZEN", "family": "AMD", "color": "#ffb200", "note": "AMD CPU", "asset_active": "badge_ryzen_on.rgb565", "asset_inactive": "badge_ryzen_off.rgb565" }
+    ]
+  },
+  "layouts": {
+    "game": { "layers": [
+      { "id": "bg", "bbox": [0,0,240,320], "type": "static", "states": "1 (fixed)", "update": "once", "asset": "bg_game.rgb565" },
+      { "id": "art", "bbox": [10,10,220,76], "type": "static", "states": "per title (key-art back layer)", "update": "on game change", "asset": "art_<title>.rgb565" },
+      { "id": "badges", "bbox": [10,96,220,66], "type": "dynamic", "states": "4 slots × {on,off}", "update": "on state change", "asset": "badge.*" },
+      { "id": "gpu_gauge", "bbox": [18,171,100,100], "type": "dynamic", "states": "0-100 %", "update": "4 fps", "asset": "gauge.ring" },
+      { "id": "gpu_read", "bbox": [18,171,100,100], "type": "dynamic", "states": "0-100 %", "update": "2 fps", "asset": "text.load" },
+      { "id": "side_read", "bbox": [132,180,88,80], "type": "dynamic", "states": "0-110 C · 0-24 GB", "update": "2 fps", "asset": "text.side" },
+      { "id": "statusbar", "bbox": [0,294,240,26], "type": "dynamic", "states": "reflex on/off · fps", "update": "8 fps", "asset": "bar.status" }
+    ] },
+    "ai": { "layers": [
+      { "id": "bg", "bbox": [0,0,240,320], "type": "static", "states": "1 (fixed)", "update": "once", "asset": "bg_ai.rgb565" },
+      { "id": "header", "bbox": [0,0,240,50], "type": "static", "states": "1 (fixed)", "update": "once", "asset": "logo_ai.rgb565" },
+      { "id": "task", "bbox": [16,58,208,14], "type": "dynamic", "states": "UTF-8 string", "update": "on task change", "asset": "text.task" },
+      { "id": "main", "bbox": [12,80,216,60], "type": "dynamic", "states": "0-100 % + scan anim", "update": "value 8 fps · scan 30 fps", "asset": "panel.main" },
+      { "id": "temp", "bbox": [12,148,102,44], "type": "dynamic", "states": "0-110 C", "update": "1 fps", "asset": "card.temp" },
+      { "id": "vram", "bbox": [126,148,102,44], "type": "dynamic", "states": "0-24 GB", "update": "2 fps", "asset": "card.vram" },
+      { "id": "console", "bbox": [12,200,216,86], "type": "dynamic", "states": "append (4 lines)", "update": "2 fps", "asset": "text.console" },
+      { "id": "statusbar", "bbox": [0,294,240,26], "type": "dynamic", "states": "ready/busy", "update": "1 fps", "asset": "bar.status" }
+    ] },
+    "idle": { "layers": [
+      { "id": "bg", "bbox": [0,0,240,320], "type": "static", "states": "1 (fixed)", "update": "once", "asset": "bg_idle.rgb565" },
+      { "id": "header", "bbox": [12,12,216,22], "type": "dynamic", "states": "date string", "update": "1 / min", "asset": "text.head" },
+      { "id": "mascot", "bbox": [60,40,120,108], "type": "dynamic", "states": "claude-hand (standby) · motherboard/ROG logo (active use)", "update": "on activity change", "asset": "logo_<claude|mobo>.rgb565" },
+      { "id": "status", "bbox": [0,152,240,12], "type": "static", "states": "1 (fixed)", "update": "once", "asset": "text.standby" },
+      { "id": "clock", "bbox": [0,164,240,44], "type": "dynamic", "states": "HH:MM", "update": "1 / min", "asset": "text.clock" },
+      { "id": "stats", "bbox": [12,216,216,74], "type": "dynamic", "states": "3 × 0-100 %", "update": "2 fps", "asset": "panel.sys" },
+      { "id": "statusbar", "bbox": [0,294,240,26], "type": "dynamic", "states": "nominal · uptime", "update": "1 fps", "asset": "bar.status" }
+    ] }
+  }
+}
