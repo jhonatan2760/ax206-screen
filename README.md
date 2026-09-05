@@ -44,7 +44,58 @@ pythonw suite.py
 - Slider de brilho (0-7)
 - Slideshow de uma pasta com intervalo configurável
 - Minimiza para a bandeja do sistema
-- "Iniciar com o Windows" restaurando o último estado (imagem/slideshow/brilho)
+- "Iniciar com o Windows" restaurando o último estado (imagem/slideshow/brilho/widget/contextual)
+- "Modo contextual (jogos)": sobe o daemon `python -m watcher` como processo
+  separado, que detecta jogo em foco / IA na GPU / standby e alimenta o motor
+  `engine/`. O daemon abre a própria conexão USB, então a suíte fecha a dela
+  antes de iniciar e faz reset USB ao parar. Qualquer outra ação da aba Tela
+  para o daemon primeiro. O status da suíte mostra o modo atual lido de
+  `watcher_status.json`; se o daemon morrer, o código aparece no status e o
+  motivo fica em `watcher.log`.
+
+## Daemon contextual (`watcher/`)
+
+Roda em Windows e Linux (mesma máquina em dual boot, GPU NVIDIA).
+
+```
+python -m watcher            # daemon (fica rodando)
+python -m watcher --status   # estado do daemon em execução
+python -m watcher --once     # detecta o contexto uma vez e imprime
+```
+
+- Um único processo é dono do USB; a suíte só edita os JSONs, que o daemon
+  recarrega sozinho quando o arquivo muda.
+- Sobrevive a tela desconectada (espera e reconecta), firmware fora de
+  sincronia (reset USB) e exceção no render (loga e segue).
+- `watcher.log` rotativo (1 MB x 3) com troca de modo e uma linha "vivo" a
+  cada 5 min; `watcher_status.json` atualizado a cada 2 s; instância única por
+  `watcher.pid`.
+- Detecção: layout do editor atribuído ao exe > jogo pela janela em foco
+  (tela cheia + GPU acima do limite, ou exe na lista) > fallback por processos
+  gráficos na GPU via NVML (Wayland) > IA (Ollama com GPU ocupada) > standby.
+- No Linux, jogos Proton/Wine aparecem com o mesmo nome de exe do Windows
+  (ex.: `cyberpunk2077.exe`), então a lista da aba Jogos vale nos dois.
+
+### Windows
+
+A suíte com "Iniciar com o Windows" já sobe o daemon no boot. Alternativa sem
+suíte: `install\windows_task.ps1` registra uma tarefa agendada no logon que
+reinicia o daemon se ele cair. Use um dos dois, não ambos.
+
+### Linux
+
+```
+pip install pyusb pillow psutil pynvml
+sudo apt install x11-utils libusb-1.0-0      # xprop/xwininfo p/ janela em foco
+bash install/linux_install.sh
+```
+
+O script instala a regra udev (acesso sem root), o quirk que impede o kernel
+de tratar a tela como pendrive (`usb-storage quirks=1908:0102:i`) e uma
+unidade systemd de usuário com `Restart=always`. Fontes: Liberation Sans ou
+DejaVu no lugar da Arial. GameMode (Feral), se instalado, conta como sinal de
+jogo. O ícone do exe é API Win32; no Linux o painel usa a capa da Steam ou só
+o título.
 
 ## CLI
 

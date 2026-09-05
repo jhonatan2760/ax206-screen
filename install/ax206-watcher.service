@@ -1,0 +1,16 @@
+# Unidade systemd de USUARIO (systemctl --user). linux_install.sh substitui @DIR@ e @PY@.
+[Unit]
+Description=AX206 GPU screen watcher
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=@DIR@
+ExecStart=@PY@ -m watcher
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target

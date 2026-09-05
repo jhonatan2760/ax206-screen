@@ -40,12 +40,8 @@ LABEL = (0x7F, 0x8A, 0xA0)
 
 
 def _font(size, bold=True):
-    for name in (("arialbd.ttf",) if bold else ("arial.ttf",)):
-        try:
-            return ImageFont.truetype(name, size)
-        except OSError:
-            pass
-    return ImageFont.load_default()
+    from .fonts import font
+    return font(size, bold)
 
 
 F11 = _font(11)

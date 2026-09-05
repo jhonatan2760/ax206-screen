@@ -1,11 +1,10 @@
 """Key art e backgrounds: Steam (cacheado) -> icone do exe -> fallback.
 Tudo gerado uma vez e salvo em cache_dir; execucoes seguintes so carregam."""
 
-import ctypes
-import ctypes.wintypes
 import json
 import os
 import re
+import sys
 import urllib.parse
 import urllib.request
 
@@ -13,7 +12,10 @@ from PIL import Image, ImageDraw
 
 from . import palette as P
 
-user32 = ctypes.windll.user32
+if sys.platform == "win32":
+    import ctypes
+    import ctypes.wintypes
+    user32 = ctypes.windll.user32
 
 _here = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CACHE = os.path.join(os.path.dirname(_here), "assets_local")
@@ -26,6 +28,8 @@ def _slug(s):
 # ---------- icone do exe (WinAPI) ----------
 
 def icon_from_exe(exe_path, size=96, bg=(16, 20, 24)):
+    if sys.platform != "win32" or not exe_path:
+        return None  # Linux: fica com a capa da Steam ou so o titulo
     try:
         N = 256
         hicon = (ctypes.c_void_p * 1)()

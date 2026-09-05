@@ -8,18 +8,24 @@ com o Windows restaurando o ultimo estado.
 Uso:
   python suite.py            # abre a janela
   python suite.py --restore  # aplica o ultimo estado e fica na bandeja (boot)
+
+Modo contextual (jogos / IA / standby) roda o daemon `python -m watcher` como
+processo separado: ele abre a propria conexao USB, entao a suite fecha a dela
+antes. O daemon escreve watcher_status.json, que a suite mostra no status.
 """
 
 import glob
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
+import psutil
 import usb.core
 from PIL import Image, ImageDraw, ImageTk
 
@@ -90,6 +96,56 @@ def send_pil_image(img, brightness=None):
             lcd.set_brightness(brightness)
         lcd.show_image(img)
     lcd_call(_do)
+
+
+def release_lcd():
+    """Fecha a conexao persistente para outro processo (watcher) usar a tela."""
+    global _lcd
+    with _lcd_lock:
+        if _lcd is not None:
+            try:
+                _lcd.close()
+            except usb.core.USBError:
+                pass
+            _lcd = None
+
+
+def reset_usb():
+    """Reset completo: unico jeito de recuperar o firmware apos um blit
+    interrompido (ex.: watcher morto no meio de um frame)."""
+    try:
+        dev = usb.core.find(idVendor=0x1908, idProduct=0x0102)
+        if dev is not None:
+            dev.reset()
+    except usb.core.USBError:
+        pass
+
+
+def _is_watcher_cmd(cmd):
+    cmd = [c.lower() for c in cmd]
+    if any(c.endswith("context_watch.py") for c in cmd):
+        return True
+    return "-m" in cmd and cmd.index("-m") + 1 < len(cmd) \
+        and cmd[cmd.index("-m") + 1] == "watcher"
+
+
+def kill_stray_watchers():
+    """Mata watchers orfaos (de uma suite anterior que morreu) antes de abrir outro."""
+    for p in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if p.pid != os.getpid() and _is_watcher_cmd(p.info["cmdline"] or []):
+                p.kill()
+                p.wait(timeout=3)
+        except (psutil.Error, OSError):
+            pass
+
+
+def read_watcher_status():
+    try:
+        with open(os.path.join(APP_DIR, "watcher_status.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
 
 # ---------- autostart ----------
@@ -221,6 +277,7 @@ def compose_view(img, scale, ox, oy):
 # ---------- scanner Steam + editor de jogos ----------
 
 CONTEXT_CFG = os.path.join(APP_DIR, "context_config.json")
+WATCHER_PKG = os.path.join(APP_DIR, "watcher")
 BADGE_CHOICES = ["RTX", "DLSS 4", "RAY TRACING", "PATH TRACING", "REFLEX",
                  "G-SYNC", "CUDA", "HDR", "FSR 3", "3D V-CACHE", "RYZEN"]
 _SKIP_STEAM = ("redistributable", "proton", "steam linux", "steamworks",
@@ -863,6 +920,7 @@ class App:
         self._send_job = None
         self._widget_stop = threading.Event()
         self._widget_thread = None
+        self._ctx_proc = None
 
         root.title("GPU Screen — AX206")
         root.resizable(False, False)
@@ -877,7 +935,7 @@ class App:
 
         # preview interativo
         left = ttk.Frame(main)
-        left.grid(row=0, column=0, rowspan=9, padx=(0, 14), sticky="n")
+        left.grid(row=0, column=0, rowspan=10, padx=(0, 14), sticky="n")
         self.preview = tk.Canvas(left, width=PREVIEW_W, height=PREVIEW_H,
                                  bg="#111", highlightthickness=1,
                                  highlightbackground="#888", cursor="fleur")
@@ -900,6 +958,9 @@ class App:
         self.widget_button = ttk.Button(main, text="Widget Claude",
                                         command=self.toggle_widget)
         self.widget_button.grid(row=8, column=1, sticky="ew", pady=2)
+        self.context_button = ttk.Button(main, text="Modo contextual (jogos)",
+                                         command=self.toggle_context)
+        self.context_button.grid(row=9, column=1, sticky="ew", pady=2)
 
         # brilho
         bright_row = ttk.Frame(main)
@@ -943,7 +1004,7 @@ class App:
             row=7, column=1, sticky="w")
 
         self.status = ttk.Label(main, text="", foreground="#555")
-        self.status.grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.status.grid(row=10, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         self._draw_placeholder()
         self._load_saved_image()
@@ -1075,6 +1136,7 @@ class App:
             return
         self.stop_slideshow()
         self.stop_widget()
+        self.stop_context()
         try:
             self.img = Image.open(path).convert("RGB")
         except OSError as e:
@@ -1093,6 +1155,7 @@ class App:
             return
         self.stop_slideshow()
         self.stop_widget()
+        self.stop_context()
         self.img = None
         rgb = tuple(int(c) for c in rgb)
         img = Image.new("RGB", (AX206.WIDTH, AX206.HEIGHT), rgb)
@@ -1103,6 +1166,7 @@ class App:
     def send_test(self):
         self.stop_slideshow()
         self.stop_widget()
+        self.stop_context()
         self.img = None
         img = Image.new("RGB", (AX206.WIDTH, AX206.HEIGHT))
         colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
@@ -1126,6 +1190,10 @@ class App:
         v = self.brightness.get()
         self._persist(brightness=v)
         msg = "Brilho: 0 (tela apagada)" if v == 0 else f"Brilho: {v}"
+        if self.context_running:
+            # nao disputar o USB com o watcher: aplica no proximo start
+            self.set_status(msg + " (aplica ao reiniciar o modo contextual)")
+            return
         self._run_bg(lambda: lcd_call(lambda lcd: lcd.set_brightness(v)), msg)
 
     def pick_folder(self):
@@ -1143,6 +1211,7 @@ class App:
             return
         interval = max(2, self.ss_interval.get())
         self.stop_widget()
+        self.stop_context()
         self._persist(mode="slideshow", slideshow_folder=folder,
                       slideshow_interval=interval)
         self.img = None
@@ -1179,6 +1248,7 @@ class App:
 
     def start_widget(self):
         self.stop_slideshow()
+        self.stop_context()
         self.img = None
         self._widget_stop.clear()
 
@@ -1209,6 +1279,76 @@ class App:
             self._widget_thread.join(timeout=2)
             self._widget_thread = None
         self.widget_button.config(text="Widget Claude")
+
+    # ----- modo contextual (context_watch.py em processo separado) -----
+
+    @property
+    def context_running(self):
+        return self._ctx_proc is not None and self._ctx_proc.poll() is None
+
+    def toggle_context(self):
+        if self.context_running:
+            self.stop_context()
+            self.set_status("Modo contextual parado")
+            return
+        self.start_context()
+
+    def start_context(self):
+        if not os.path.isdir(WATCHER_PKG):
+            self.set_status("pasta watcher/ nao encontrada na pasta da suite")
+            return
+        self.stop_slideshow()
+        self.stop_widget()
+        self.stop_context()
+        self.img = None
+        kill_stray_watchers()
+        b = self.cfg.get("brightness")
+        if b is not None:
+            try:
+                lcd_call(lambda lcd: lcd.set_brightness(b))
+            except (AX206Error, usb.core.USBError):
+                pass
+        release_lcd()  # o watcher abre a propria conexao USB
+        pyw = sys.executable.replace("python.exe", "pythonw.exe")
+        try:
+            self._ctx_proc = subprocess.Popen(
+                [pyw, "-m", "watcher"], cwd=APP_DIR,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError as e:
+            self.set_status(f"Nao abriu o watcher: {e}")
+            return
+        self._persist(mode="context")
+        self.context_button.config(text="Parar modo contextual")
+        self.set_status("Modo contextual rodando (jogos / IA / standby)")
+        self.root.after(2000, self._poll_context)
+
+    def stop_context(self):
+        proc, self._ctx_proc = self._ctx_proc, None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            # morreu possivelmente no meio de um blit: firmware fora de sincronia
+            reset_usb()
+        self.context_button.config(text="Modo contextual (jogos)")
+
+    def _poll_context(self):
+        proc = self._ctx_proc
+        if proc is None:
+            return
+        code = proc.poll()
+        if code is None:
+            st = read_watcher_status()
+            if st and st.get("pid") == proc.pid:
+                detail = st.get("detail") or ""
+                self.set_status(f"Modo contextual: {st.get('mode')} {detail}".rstrip())
+            self.root.after(2000, self._poll_context)
+            return
+        self._ctx_proc = None
+        self.context_button.config(text="Modo contextual (jogos)")
+        self.set_status(f"Modo contextual parou (codigo {code}) - veja watcher.log")
 
     def toggle_autostart(self):
         try:
@@ -1258,6 +1398,7 @@ class App:
     def quit(self):
         self.stop_slideshow()
         self.stop_widget()
+        self.stop_context()
         if self.tray_icon:
             self.tray_icon.stop()
         self.root.destroy()
@@ -1270,6 +1411,8 @@ def main():
     if restore:
         if app.cfg.get("mode") == "widget":
             root.after(500, app.start_widget)
+        elif app.cfg.get("mode") == "context":
+            root.after(500, app.start_context)
         else:
             threading.Thread(
                 target=restore_state, args=(app.cfg, app.slideshow), daemon=True
