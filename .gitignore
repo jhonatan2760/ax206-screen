@@ -2,3 +2,8 @@ __pycache__/
 config.json
 test_image.png
 *.pcap
+watcher.log
+watcher.log.*
+watcher_status.json
+watcher.pid
+watcher_error.log

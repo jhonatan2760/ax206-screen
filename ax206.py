@@ -7,6 +7,7 @@ Baseado no protocolo aberto do projeto dpf-ax (lcd4linux drv_dpf / libdpf).
 """
 
 import struct
+import sys
 
 import usb.core
 import usb.util
@@ -35,6 +36,14 @@ class AX206:
                 "Tela nao encontrada (VID 1908 PID 0102). "
                 "Verifique o cabo USB e se o AIDA64 nao esta rodando."
             )
+        if sys.platform != "win32":
+            # Linux: a tela se apresenta como pendrive e o kernel liga o
+            # usb-storage nela; precisa soltar antes de falar direto
+            try:
+                if self.dev.is_kernel_driver_active(0):
+                    self.dev.detach_kernel_driver(0)
+            except (usb.core.USBError, NotImplementedError):
+                pass
         try:
             self.dev.set_configuration()
         except usb.core.USBError:

@@ -232,13 +232,8 @@ def render_anim_region(t, blink):
 # ---------- layout ----------
 
 def load_fonts():
-    try:
-        return (ImageFont.truetype("arialbd.ttf", 22),
-                ImageFont.truetype("arialbd.ttf", 26),
-                ImageFont.truetype("arial.ttf", 15))
-    except OSError:
-        f = ImageFont.load_default()
-        return f, f, f
+    from engine.fonts import font
+    return font(22), font(26), font(15, bold=False)
 
 
 F_TITLE, F_BIG, F_SMALL = load_fonts()

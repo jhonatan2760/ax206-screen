@@ -8,16 +8,24 @@ com o Windows restaurando o ultimo estado.
 Uso:
   python suite.py            # abre a janela
   python suite.py --restore  # aplica o ultimo estado e fica na bandeja (boot)
+
+Modo contextual (jogos / IA / standby) roda o daemon `python -m watcher` como
+processo separado: ele abre a propria conexao USB, entao a suite fecha a dela
+antes. O daemon escreve watcher_status.json, que a suite mostra no status.
 """
 
+import glob
 import json
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
+import psutil
 import usb.core
 from PIL import Image, ImageDraw, ImageTk
 
@@ -88,6 +96,56 @@ def send_pil_image(img, brightness=None):
             lcd.set_brightness(brightness)
         lcd.show_image(img)
     lcd_call(_do)
+
+
+def release_lcd():
+    """Fecha a conexao persistente para outro processo (watcher) usar a tela."""
+    global _lcd
+    with _lcd_lock:
+        if _lcd is not None:
+            try:
+                _lcd.close()
+            except usb.core.USBError:
+                pass
+            _lcd = None
+
+
+def reset_usb():
+    """Reset completo: unico jeito de recuperar o firmware apos um blit
+    interrompido (ex.: watcher morto no meio de um frame)."""
+    try:
+        dev = usb.core.find(idVendor=0x1908, idProduct=0x0102)
+        if dev is not None:
+            dev.reset()
+    except usb.core.USBError:
+        pass
+
+
+def _is_watcher_cmd(cmd):
+    cmd = [c.lower() for c in cmd]
+    if any(c.endswith("context_watch.py") for c in cmd):
+        return True
+    return "-m" in cmd and cmd.index("-m") + 1 < len(cmd) \
+        and cmd[cmd.index("-m") + 1] == "watcher"
+
+
+def kill_stray_watchers():
+    """Mata watchers orfaos (de uma suite anterior que morreu) antes de abrir outro."""
+    for p in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if p.pid != os.getpid() and _is_watcher_cmd(p.info["cmdline"] or []):
+                p.kill()
+                p.wait(timeout=3)
+        except (psutil.Error, OSError):
+            pass
+
+
+def read_watcher_status():
+    try:
+        with open(os.path.join(APP_DIR, "watcher_status.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
 
 # ---------- autostart ----------
@@ -216,6 +274,634 @@ def compose_view(img, scale, ox, oy):
     return img.crop(box).resize((AX206.WIDTH, AX206.HEIGHT), Image.LANCZOS)
 
 
+# ---------- scanner Steam + editor de jogos ----------
+
+CONTEXT_CFG = os.path.join(APP_DIR, "context_config.json")
+WATCHER_PKG = os.path.join(APP_DIR, "watcher")
+BADGE_CHOICES = ["RTX", "DLSS 4", "RAY TRACING", "PATH TRACING", "REFLEX",
+                 "G-SYNC", "CUDA", "HDR", "FSR 3", "3D V-CACHE", "RYZEN"]
+_SKIP_STEAM = ("redistributable", "proton", "steam linux", "steamworks",
+               "runtime", "soundtrack", "dedicated server", "sdk")
+_SKIP_EXE = ("unins", "crash", "setup", "redist", "vcredist", "dxsetup",
+             "report", "eac", "anticheat", "helper")
+
+
+def find_main_exe(gamedir):
+    """Maior .exe ate 2 niveis de profundidade (heuristica do executavel)."""
+    best, best_size = None, 0
+    base_depth = gamedir.rstrip("\\/").count(os.sep)
+    for root_, dirs, files in os.walk(gamedir):
+        if root_.count(os.sep) - base_depth >= 4:
+            dirs[:] = []
+        for f in files:
+            lf = f.lower()
+            if not lf.endswith(".exe") or any(s in lf for s in _SKIP_EXE):
+                continue
+            p = os.path.join(root_, f)
+            try:
+                sz = os.path.getsize(p)
+            except OSError:
+                continue
+            if sz > best_size:
+                best, best_size = p, sz
+    return best
+
+
+def scan_steam_games():
+    """Le a biblioteca Steam local: [(nome, appid, exe_path), ...]."""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Valve\Steam") as k:
+            steam = winreg.QueryValueEx(k, "SteamPath")[0]
+    except OSError:
+        return []
+    libs = {steam}
+    vdf = os.path.join(steam, "steamapps", "libraryfolders.vdf")
+    try:
+        text = open(vdf, encoding="utf-8", errors="ignore").read()
+        libs |= {p.replace("\\\\", "\\")
+                 for p in re.findall(r'"path"\s+"([^"]+)"', text)}
+    except OSError:
+        pass
+    games = []
+    for lib in libs:
+        sa = os.path.join(lib, "steamapps")
+        for acf in glob.glob(os.path.join(sa, "appmanifest_*.acf")):
+            try:
+                t = open(acf, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                continue
+            name = re.search(r'"name"\s+"([^"]+)"', t)
+            idir = re.search(r'"installdir"\s+"([^"]+)"', t)
+            appid = re.search(r'"appid"\s+"(\d+)"', t)
+            if not (name and idir):
+                continue
+            nm = name.group(1)
+            if any(s in nm.lower() for s in _SKIP_STEAM):
+                continue
+            gamedir = os.path.join(sa, "common", idir.group(1))
+            exe = find_main_exe(gamedir) if os.path.isdir(gamedir) else None
+            games.append((nm, appid.group(1) if appid else None, exe))
+    return sorted(games)
+
+
+def load_context_cfg():
+    try:
+        return json.load(open(CONTEXT_CFG, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"poll_seconds": 3, "game_min_gpu_util": 30,
+                "default_game_badges": ["RTX", "DLSS 4", "RAY TRACING",
+                                        "REFLEX"],
+                "not_games": [], "games": {},
+                "ai_processes": ["ollama.exe"], "ai_min_gpu_util": 25}
+
+
+class GamesPanel(ttk.Frame):
+    """Aba de configuracao dos jogos: scanner Steam, edicao manual e
+    geracao dos paineis de key art."""
+
+    def __init__(self, parent):
+        super().__init__(parent, padding=10)
+        self.cfg = load_context_cfg()
+        self._preview_img = None
+
+        # esquerda: lista + acoes
+        left = ttk.Frame(self)
+        left.grid(row=0, column=0, sticky="ns", padx=(0, 12))
+        self.listbox = tk.Listbox(left, width=30, height=16,
+                                  exportselection=False)
+        self.listbox.grid(row=0, column=0, columnspan=2, sticky="ns")
+        self.listbox.bind("<<ListboxSelect>>", self._on_select)
+        ttk.Button(left, text="Escanear Steam",
+                   command=self.scan_steam).grid(row=1, column=0,
+                                                 sticky="ew", pady=(6, 2))
+        ttk.Button(left, text="Adicionar exe...",
+                   command=self.add_exe).grid(row=1, column=1,
+                                              sticky="ew", pady=(6, 2),
+                                              padx=(4, 0))
+        ttk.Button(left, text="Remover",
+                   command=self.remove).grid(row=2, column=0,
+                                             columnspan=2, sticky="ew")
+        ttk.Button(left, text="Gerar todos os paineis",
+                   command=self.generate_all).grid(row=3, column=0,
+                                                   columnspan=2,
+                                                   sticky="ew", pady=(8, 0))
+
+        # direita: editor
+        right = ttk.Frame(self)
+        right.grid(row=0, column=1, sticky="n")
+        ttk.Label(right, text="Executavel:").grid(row=0, column=0, sticky="w")
+        self.exe_label = ttk.Label(right, text="—", foreground="#777")
+        self.exe_label.grid(row=0, column=1, sticky="w")
+        ttk.Label(right, text="Titulo:").grid(row=1, column=0, sticky="w",
+                                              pady=(6, 0))
+        self.title_var = tk.StringVar()
+        ttk.Entry(right, textvariable=self.title_var, width=28).grid(
+            row=1, column=1, sticky="ew", pady=(6, 0))
+
+        ttk.Label(right, text="Badges:").grid(row=2, column=0, sticky="nw",
+                                              pady=(8, 0))
+        badges = ttk.Frame(right)
+        badges.grid(row=2, column=1, sticky="w", pady=(8, 0))
+        self.badge_vars = {}
+        for i, b in enumerate(BADGE_CHOICES):
+            v = tk.BooleanVar()
+            ttk.Checkbutton(badges, text=b, variable=v).grid(
+                row=i % 6, column=i // 6, sticky="w")
+            self.badge_vars[b] = v
+
+        self.preview = tk.Canvas(right, width=220, height=76, bg="#111",
+                                 highlightthickness=1,
+                                 highlightbackground="#888")
+        self.preview.grid(row=3, column=0, columnspan=2, pady=10)
+
+        btns = ttk.Frame(right)
+        btns.grid(row=4, column=0, columnspan=2, sticky="ew")
+        ttk.Button(btns, text="Gerar painel",
+                   command=self.generate_panel).pack(side="left",
+                                                     expand=True, fill="x")
+        ttk.Button(btns, text="Salvar",
+                   command=self.save_current).pack(side="left", expand=True,
+                                                   fill="x", padx=(6, 0))
+        self.gstatus = ttk.Label(self, text="", foreground="#555")
+        self.gstatus.grid(row=1, column=0, columnspan=2, sticky="w",
+                          pady=(8, 0))
+        self._reload_list()
+
+    # ---- helpers ----
+
+    def _save_cfg(self):
+        with open(CONTEXT_CFG, "w", encoding="utf-8") as f:
+            json.dump(self.cfg, f, indent=2, ensure_ascii=False)
+
+    def _reload_list(self):
+        self.listbox.delete(0, "end")
+        for exe in sorted(self.cfg["games"]):
+            self.listbox.insert("end",
+                                self.cfg["games"][exe].get("title", exe))
+
+    def _selected_exe(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return None
+        return sorted(self.cfg["games"])[sel[0]]
+
+    def _on_select(self, _ev=None):
+        exe = self._selected_exe()
+        if not exe:
+            return
+        g = self.cfg["games"][exe]
+        self.exe_label.config(text=exe)
+        self.title_var.set(g.get("title", ""))
+        for b, v in self.badge_vars.items():
+            v.set(b in g.get("badges", []))
+        self._show_cached_panel(g.get("title", ""))
+
+    def _show_cached_panel(self, title):
+        from engine.keyart import DEFAULT_CACHE, _slug
+        path = os.path.join(DEFAULT_CACHE, f"art_{_slug(title)}.png")
+        self.preview.delete("all")
+        if os.path.exists(path):
+            img = Image.open(path)
+            self._preview_img = ImageTk.PhotoImage(img)
+            self.preview.create_image(110, 38, image=self._preview_img)
+
+    # ---- acoes ----
+
+    def scan_steam(self):
+        self.gstatus.config(text="Escaneando biblioteca Steam...")
+
+        def worker():
+            found = scan_steam_games()
+            added = 0
+            for name, appid, exe in found:
+                if not exe:
+                    continue
+                key = os.path.basename(exe).lower()
+                if key in self.cfg["games"]:
+                    continue
+                title = re.sub(r"[™®�]", "", name).strip()
+                self.cfg["games"][key] = {
+                    "title": title,
+                    "badges": list(self.cfg["default_game_badges"]),
+                    "exe_path": exe, "appid": appid}
+                added += 1
+            self._save_cfg()
+            self.after(0, lambda: (self._reload_list(), self.gstatus.config(
+                text=f"{len(found)} jogos na Steam, {added} adicionados — "
+                     f"gerando paineis...")))
+            self.after(200, self.generate_all)  # pre-gera tudo sozinho
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def add_exe(self):
+        path = filedialog.askopenfilename(
+            title="Executavel do jogo",
+            filetypes=[("Executaveis", "*.exe")])
+        if not path:
+            return
+        key = os.path.basename(path).lower()
+        title = os.path.splitext(os.path.basename(path))[0].upper()
+        self.cfg["games"].setdefault(key, {
+            "title": title,
+            "badges": list(self.cfg["default_game_badges"]),
+            "exe_path": path})
+        self._save_cfg()
+        self._reload_list()
+        self.gstatus.config(text=f"{key} adicionado — ajuste titulo e badges")
+
+    def remove(self):
+        exe = self._selected_exe()
+        if exe and messagebox.askyesno("Remover", f"Remover {exe}?"):
+            del self.cfg["games"][exe]
+            self._save_cfg()
+            self._reload_list()
+
+    def save_current(self):
+        exe = self._selected_exe()
+        if not exe:
+            return
+        g = self.cfg["games"][exe]
+        g["title"] = self.title_var.get().strip() or g.get("title", exe)
+        g["badges"] = [b for b, v in self.badge_vars.items() if v.get()]
+        self._save_cfg()
+        self.gstatus.config(text=f"{g['title']} salvo")
+
+    def generate_panel(self, exe=None, silent=False):
+        exe = exe or self._selected_exe()
+        if not exe:
+            return
+        g = self.cfg["games"][exe]
+        title = g.get("title", exe)
+        if not silent:
+            self.gstatus.config(text=f"Gerando painel de {title}...")
+
+        def worker():
+            from engine.keyart import art_panel, DEFAULT_CACHE, _slug
+            stale = os.path.join(DEFAULT_CACHE, f"art_{_slug(title)}.png")
+            if os.path.exists(stale):
+                os.remove(stale)
+            miss = os.path.join(DEFAULT_CACHE, f"steam_{_slug(title)}.miss")
+            if os.path.exists(miss):
+                os.remove(miss)
+            art_panel(title, g.get("exe_path"))
+            if not silent:
+                self.after(0, lambda: (self._show_cached_panel(title),
+                                       self.gstatus.config(
+                                           text=f"Painel de {title} pronto")))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def generate_all(self):
+        exes = list(self.cfg["games"])
+        self.gstatus.config(text=f"Gerando {len(exes)} paineis...")
+
+        def worker():
+            from engine.keyart import art_panel
+            for i, exe in enumerate(exes, 1):
+                g = self.cfg["games"][exe]
+                art_panel(g.get("title", exe), g.get("exe_path"))
+                self.after(0, lambda i=i: self.gstatus.config(
+                    text=f"Paineis: {i}/{len(exes)}"))
+            self.after(0, lambda: self.gstatus.config(
+                text=f"{len(exes)} paineis prontos (cacheados)"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+# ---------- editor de layouts (home / por programa) ----------
+
+LAYOUTS_PATH = os.path.join(APP_DIR, "layouts_user.json")
+
+
+def load_layouts():
+    try:
+        return json.load(open(LAYOUTS_PATH, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"layouts": {"home": {"bg": "#0e0d14", "elements": [
+            {"type": "mascot", "x": 60, "y": 40},
+            {"type": "clock", "x": 60, "y": 164, "size": "L",
+             "color": "#f7f3f7"},
+            {"type": "stats", "x": 12, "y": 216},
+        ]}}, "assign": {"home": "home", "per_exe": {}}}
+
+
+class LayoutEditor(ttk.Frame):
+    """Editor visual: arrasta elementos num canvas 240x320 e salva
+    layouts atribuiveis ao standby (home) ou a programas especificos."""
+
+    def __init__(self, parent):
+        super().__init__(parent, padding=10)
+        self.data = load_layouts()
+        self.current = next(iter(self.data["layouts"]))
+        self.sel = None
+        self._drag = None
+        self._photo = None
+
+        # topo: seletor de layout + atribuicao
+        top = ttk.Frame(self)
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(top, text="Layout:").pack(side="left")
+        self.layout_var = tk.StringVar(value=self.current)
+        self.layout_cb = ttk.Combobox(top, textvariable=self.layout_var,
+                                      width=14, state="readonly")
+        self.layout_cb.pack(side="left", padx=4)
+        self.layout_cb.bind("<<ComboboxSelected>>", self._switch_layout)
+        ttk.Button(top, text="Novo", width=6,
+                   command=self._new_layout).pack(side="left")
+        ttk.Button(top, text="Excluir", width=7,
+                   command=self._del_layout).pack(side="left", padx=(4, 10))
+        ttk.Label(top, text="Usar em:").pack(side="left")
+        self.assign_var = tk.StringVar()
+        self.assign_cb = ttk.Combobox(top, textvariable=self.assign_var,
+                                      width=18)
+        self.assign_cb.pack(side="left", padx=4)
+        ttk.Button(top, text="Atribuir", width=8,
+                   command=self._assign).pack(side="left")
+
+        # canvas
+        self.canvas = tk.Canvas(self, width=240, height=320, bg="#000",
+                                highlightthickness=1,
+                                highlightbackground="#888", cursor="fleur")
+        self.canvas.grid(row=1, column=0, rowspan=2, padx=(0, 12), sticky="n")
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._motion)
+
+        # direita: elementos + propriedades
+        right = ttk.Frame(self)
+        right.grid(row=1, column=1, sticky="n")
+        add = ttk.Frame(right)
+        add.grid(row=0, column=0, columnspan=2, sticky="ew")
+        for i, (txt, fn) in enumerate([
+                ("+ Imagem", lambda: self._add_media("image")),
+                ("+ GIF", lambda: self._add_media("gif")),
+                ("+ Relogio", lambda: self._add({"type": "clock", "x": 60,
+                                                 "y": 140, "size": "L",
+                                                 "color": "#f7f3f7"})),
+                ("+ Texto", lambda: self._add({"type": "text", "x": 20,
+                                               "y": 20, "text": "TEXTO",
+                                               "size": "M",
+                                               "color": "#9ca2b5"})),
+                ("+ Stats", lambda: self._add({"type": "stats", "x": 12,
+                                               "y": 216})),
+                ("+ Mascote", lambda: self._add({"type": "mascot", "x": 60,
+                                                 "y": 40}))]):
+            ttk.Button(add, text=txt, width=10, command=fn).grid(
+                row=i // 2, column=i % 2, sticky="ew", pady=1, padx=1)
+
+        self.el_list = tk.Listbox(right, width=24, height=7,
+                                  exportselection=False)
+        self.el_list.grid(row=1, column=0, columnspan=2, pady=6, sticky="ew")
+        self.el_list.bind("<<ListboxSelect>>", self._select_from_list)
+        ttk.Button(right, text="Remover elemento",
+                   command=self._remove_el).grid(row=2, column=0,
+                                                 columnspan=2, sticky="ew")
+
+        props = ttk.Frame(right)
+        props.grid(row=3, column=0, columnspan=2, pady=(8, 0), sticky="ew")
+        ttk.Label(props, text="Escala %:").grid(row=0, column=0, sticky="w")
+        self.scale_var = tk.IntVar(value=100)
+        ttk.Spinbox(props, from_=10, to=400, increment=10, width=6,
+                    textvariable=self.scale_var,
+                    command=self._apply_props).grid(row=0, column=1)
+        ttk.Label(props, text="Texto:").grid(row=1, column=0, sticky="w")
+        self.text_var = tk.StringVar()
+        e = ttk.Entry(props, textvariable=self.text_var, width=16)
+        e.grid(row=1, column=1)
+        e.bind("<Return>", lambda _e: self._apply_props())
+        ttk.Label(props, text="Tamanho:").grid(row=2, column=0, sticky="w")
+        self.size_var = tk.StringVar(value="M")
+        ttk.Combobox(props, textvariable=self.size_var, width=4,
+                     values=["S", "M", "L"], state="readonly").grid(
+            row=2, column=1, sticky="w")
+        ttk.Button(props, text="Cor...", command=self._pick_color).grid(
+            row=3, column=0, sticky="w", pady=2)
+        ttk.Button(props, text="Aplicar", command=self._apply_props).grid(
+            row=3, column=1, sticky="e", pady=2)
+
+        bot = ttk.Frame(right)
+        bot.grid(row=4, column=0, columnspan=2, pady=(8, 0), sticky="ew")
+        ttk.Button(bot, text="Fundo cor...",
+                   command=self._bg_color).pack(side="left", expand=True,
+                                                fill="x")
+        ttk.Button(bot, text="Fundo img...",
+                   command=self._bg_image).pack(side="left", expand=True,
+                                                fill="x", padx=(4, 0))
+        ttk.Button(right, text="Salvar layout",
+                   command=self._save).grid(row=5, column=0, columnspan=2,
+                                            sticky="ew", pady=(8, 0))
+        self.estatus = ttk.Label(self, text="", foreground="#555")
+        self.estatus.grid(row=2, column=1, sticky="sw")
+
+        self._refresh_layout_cb()
+        self._refresh_assign_cb()
+        self._redraw()
+
+    # ---- persistencia / listas ----
+
+    def _layout(self):
+        return self.data["layouts"][self.current]
+
+    def _save(self):
+        with open(LAYOUTS_PATH, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, indent=2, ensure_ascii=False)
+        self.estatus.config(text="Salvo — watcher aplica em ate 3s")
+
+    def _refresh_layout_cb(self):
+        self.layout_cb["values"] = sorted(self.data["layouts"])
+        self.layout_var.set(self.current)
+
+    def _refresh_assign_cb(self):
+        exes = sorted(load_context_cfg()["games"])
+        self.assign_cb["values"] = ["home (standby)"] + exes
+        cur = [f"{exe} -> {name}" for exe, name in
+               self.data["assign"].get("per_exe", {}).items()]
+        if self.data["assign"].get("home"):
+            cur.insert(0, f"home -> {self.data['assign']['home']}")
+
+    def _refresh_el_list(self):
+        self.el_list.delete(0, "end")
+        for i, el in enumerate(self._layout().get("elements", [])):
+            label = el["type"]
+            if el["type"] in ("image", "gif"):
+                label += " " + os.path.basename(el.get("path", ""))[:14]
+            elif el["type"] == "text":
+                label += f' "{el.get("text", "")[:12]}"'
+            self.el_list.insert("end", f"{i}: {label}")
+        if self.sel is not None and self.sel < self.el_list.size():
+            self.el_list.selection_set(self.sel)
+
+    # ---- render ----
+
+    def _redraw(self):
+        from engine.user_layout import compose_frame, element_bbox, _rgb
+        try:
+            frame = compose_frame(self._layout(),
+                                  mascot_draw=_editor_mascot)
+        except Exception as e:
+            self.estatus.config(text=f"Erro no layout: {e}")
+            return
+        self._photo = ImageTk.PhotoImage(frame)
+        self.canvas.delete("all")
+        self.canvas.create_image(120, 160, image=self._photo)
+        if self.sel is not None:
+            els = self._layout().get("elements", [])
+            if self.sel < len(els):
+                x, y, w, h = element_bbox(els[self.sel],
+                                          _rgb(self._layout().get("bg")))
+                self.canvas.create_rectangle(x, y, x + w, y + h,
+                                             outline="#ff4444", width=2)
+        self._refresh_el_list()
+
+    # ---- interacao ----
+
+    def _press(self, ev):
+        from engine.user_layout import element_bbox, _rgb
+        els = self._layout().get("elements", [])
+        bgc = _rgb(self._layout().get("bg"))
+        self.sel = None
+        for i in range(len(els) - 1, -1, -1):
+            x, y, w, h = element_bbox(els[i], bgc)
+            if x <= ev.x <= x + w and y <= ev.y <= y + h:
+                self.sel = i
+                self._drag = (ev.x, ev.y, els[i].get("x", 0),
+                              els[i].get("y", 0))
+                self._load_props(els[i])
+                break
+        self._redraw()
+
+    def _motion(self, ev):
+        if self.sel is None or self._drag is None:
+            return
+        x0, y0, ex, ey = self._drag
+        el = self._layout()["elements"][self.sel]
+        el["x"] = ex + (ev.x - x0)
+        el["y"] = ey + (ev.y - y0)
+        self._redraw()
+
+    def _select_from_list(self, _ev=None):
+        sel = self.el_list.curselection()
+        if sel:
+            self.sel = sel[0]
+            self._load_props(self._layout()["elements"][self.sel])
+            self._redraw()
+
+    def _load_props(self, el):
+        self.scale_var.set(el.get("scale", 100))
+        self.text_var.set(el.get("text", ""))
+        self.size_var.set(el.get("size", "M"))
+
+    def _apply_props(self):
+        if self.sel is None:
+            return
+        el = self._layout()["elements"][self.sel]
+        if el["type"] in ("image", "gif"):
+            el["scale"] = self.scale_var.get()
+        if el["type"] == "text":
+            el["text"] = self.text_var.get()
+        if el["type"] in ("text", "clock"):
+            el["size"] = self.size_var.get()
+        self._redraw()
+
+    def _pick_color(self):
+        if self.sel is None:
+            return
+        el = self._layout()["elements"][self.sel]
+        rgb, hexv = colorchooser.askcolor(title="Cor do elemento")
+        if hexv and el["type"] in ("text", "clock"):
+            el["color"] = hexv
+            self._redraw()
+
+    # ---- acoes ----
+
+    def _add(self, el):
+        self._layout().setdefault("elements", []).append(el)
+        self.sel = len(self._layout()["elements"]) - 1
+        self._redraw()
+
+    def _add_media(self, typ):
+        path = filedialog.askopenfilename(
+            title="Escolher arquivo",
+            filetypes=[("Imagens/GIF", "*.png *.jpg *.jpeg *.gif *.bmp "
+                        "*.webp")])
+        if path:
+            self._add({"type": typ, "x": 40, "y": 40, "path": path,
+                       "scale": 100})
+
+    def _remove_el(self):
+        if self.sel is not None:
+            els = self._layout().get("elements", [])
+            if self.sel < len(els):
+                del els[self.sel]
+                self.sel = None
+                self._redraw()
+
+    def _bg_color(self):
+        rgb, hexv = colorchooser.askcolor(title="Cor de fundo")
+        if hexv:
+            self._layout()["bg"] = hexv
+            self._redraw()
+
+    def _bg_image(self):
+        path = filedialog.askopenfilename(
+            title="Imagem de fundo",
+            filetypes=[("Imagens", "*.png *.jpg *.jpeg *.bmp *.webp")])
+        if path:
+            self._layout()["bg"] = path
+            self._redraw()
+
+    def _switch_layout(self, _ev=None):
+        self.current = self.layout_var.get()
+        self.sel = None
+        self._redraw()
+
+    def _new_layout(self):
+        import tkinter.simpledialog as sd
+        name = sd.askstring("Novo layout", "Nome do layout:")
+        if not name or name in self.data["layouts"]:
+            return
+        self.data["layouts"][name] = {"bg": "#0e0d14", "elements": []}
+        self.current = name
+        self._refresh_layout_cb()
+        self._redraw()
+
+    def _del_layout(self):
+        if len(self.data["layouts"]) <= 1:
+            return
+        if messagebox.askyesno("Excluir", f"Excluir '{self.current}'?"):
+            del self.data["layouts"][self.current]
+            a = self.data["assign"]
+            if a.get("home") == self.current:
+                a["home"] = None
+            a["per_exe"] = {k: v for k, v in a.get("per_exe", {}).items()
+                            if v != self.current}
+            self.current = next(iter(self.data["layouts"]))
+            self._refresh_layout_cb()
+            self._redraw()
+
+    def _assign(self):
+        target = self.assign_var.get().strip().lower()
+        if not target:
+            return
+        if target.startswith("home"):
+            self.data["assign"]["home"] = self.current
+            msg = f"standby usa '{self.current}'"
+        else:
+            self.data["assign"].setdefault("per_exe", {})[target] = \
+                self.current
+            msg = f"{target} usa '{self.current}'"
+        self._save()
+        self.estatus.config(text=f"Atribuido: {msg}")
+
+
+def _editor_mascot(img, t, blink):
+    import widget_claude as wc
+    from PIL import ImageDraw
+    wc.draw_clawd(ImageDraw.Draw(img), img.width // 2,
+                  img.height // 2 - 6, blink, legs_t=t, px=5)
+
+
 # ---------- GUI ----------
 
 class App:
@@ -234,17 +920,22 @@ class App:
         self._send_job = None
         self._widget_stop = threading.Event()
         self._widget_thread = None
+        self._ctx_proc = None
 
         root.title("GPU Screen — AX206")
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
 
-        main = ttk.Frame(root, padding=12)
-        main.grid()
+        notebook = ttk.Notebook(root)
+        notebook.pack(fill="both", expand=True)
+        main = ttk.Frame(notebook, padding=12)
+        notebook.add(main, text="Tela")
+        notebook.add(GamesPanel(notebook), text="Jogos")
+        notebook.add(LayoutEditor(notebook), text="Editor")
 
         # preview interativo
         left = ttk.Frame(main)
-        left.grid(row=0, column=0, rowspan=9, padx=(0, 14), sticky="n")
+        left.grid(row=0, column=0, rowspan=10, padx=(0, 14), sticky="n")
         self.preview = tk.Canvas(left, width=PREVIEW_W, height=PREVIEW_H,
                                  bg="#111", highlightthickness=1,
                                  highlightbackground="#888", cursor="fleur")
@@ -267,6 +958,9 @@ class App:
         self.widget_button = ttk.Button(main, text="Widget Claude",
                                         command=self.toggle_widget)
         self.widget_button.grid(row=8, column=1, sticky="ew", pady=2)
+        self.context_button = ttk.Button(main, text="Modo contextual (jogos)",
+                                         command=self.toggle_context)
+        self.context_button.grid(row=9, column=1, sticky="ew", pady=2)
 
         # brilho
         bright_row = ttk.Frame(main)
@@ -310,7 +1004,7 @@ class App:
             row=7, column=1, sticky="w")
 
         self.status = ttk.Label(main, text="", foreground="#555")
-        self.status.grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.status.grid(row=10, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         self._draw_placeholder()
         self._load_saved_image()
@@ -442,6 +1136,7 @@ class App:
             return
         self.stop_slideshow()
         self.stop_widget()
+        self.stop_context()
         try:
             self.img = Image.open(path).convert("RGB")
         except OSError as e:
@@ -460,6 +1155,7 @@ class App:
             return
         self.stop_slideshow()
         self.stop_widget()
+        self.stop_context()
         self.img = None
         rgb = tuple(int(c) for c in rgb)
         img = Image.new("RGB", (AX206.WIDTH, AX206.HEIGHT), rgb)
@@ -470,6 +1166,7 @@ class App:
     def send_test(self):
         self.stop_slideshow()
         self.stop_widget()
+        self.stop_context()
         self.img = None
         img = Image.new("RGB", (AX206.WIDTH, AX206.HEIGHT))
         colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
@@ -493,6 +1190,10 @@ class App:
         v = self.brightness.get()
         self._persist(brightness=v)
         msg = "Brilho: 0 (tela apagada)" if v == 0 else f"Brilho: {v}"
+        if self.context_running:
+            # nao disputar o USB com o watcher: aplica no proximo start
+            self.set_status(msg + " (aplica ao reiniciar o modo contextual)")
+            return
         self._run_bg(lambda: lcd_call(lambda lcd: lcd.set_brightness(v)), msg)
 
     def pick_folder(self):
@@ -510,6 +1211,7 @@ class App:
             return
         interval = max(2, self.ss_interval.get())
         self.stop_widget()
+        self.stop_context()
         self._persist(mode="slideshow", slideshow_folder=folder,
                       slideshow_interval=interval)
         self.img = None
@@ -546,6 +1248,7 @@ class App:
 
     def start_widget(self):
         self.stop_slideshow()
+        self.stop_context()
         self.img = None
         self._widget_stop.clear()
 
@@ -576,6 +1279,76 @@ class App:
             self._widget_thread.join(timeout=2)
             self._widget_thread = None
         self.widget_button.config(text="Widget Claude")
+
+    # ----- modo contextual (context_watch.py em processo separado) -----
+
+    @property
+    def context_running(self):
+        return self._ctx_proc is not None and self._ctx_proc.poll() is None
+
+    def toggle_context(self):
+        if self.context_running:
+            self.stop_context()
+            self.set_status("Modo contextual parado")
+            return
+        self.start_context()
+
+    def start_context(self):
+        if not os.path.isdir(WATCHER_PKG):
+            self.set_status("pasta watcher/ nao encontrada na pasta da suite")
+            return
+        self.stop_slideshow()
+        self.stop_widget()
+        self.stop_context()
+        self.img = None
+        kill_stray_watchers()
+        b = self.cfg.get("brightness")
+        if b is not None:
+            try:
+                lcd_call(lambda lcd: lcd.set_brightness(b))
+            except (AX206Error, usb.core.USBError):
+                pass
+        release_lcd()  # o watcher abre a propria conexao USB
+        pyw = sys.executable.replace("python.exe", "pythonw.exe")
+        try:
+            self._ctx_proc = subprocess.Popen(
+                [pyw, "-m", "watcher"], cwd=APP_DIR,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError as e:
+            self.set_status(f"Nao abriu o watcher: {e}")
+            return
+        self._persist(mode="context")
+        self.context_button.config(text="Parar modo contextual")
+        self.set_status("Modo contextual rodando (jogos / IA / standby)")
+        self.root.after(2000, self._poll_context)
+
+    def stop_context(self):
+        proc, self._ctx_proc = self._ctx_proc, None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            # morreu possivelmente no meio de um blit: firmware fora de sincronia
+            reset_usb()
+        self.context_button.config(text="Modo contextual (jogos)")
+
+    def _poll_context(self):
+        proc = self._ctx_proc
+        if proc is None:
+            return
+        code = proc.poll()
+        if code is None:
+            st = read_watcher_status()
+            if st and st.get("pid") == proc.pid:
+                detail = st.get("detail") or ""
+                self.set_status(f"Modo contextual: {st.get('mode')} {detail}".rstrip())
+            self.root.after(2000, self._poll_context)
+            return
+        self._ctx_proc = None
+        self.context_button.config(text="Modo contextual (jogos)")
+        self.set_status(f"Modo contextual parou (codigo {code}) - veja watcher.log")
 
     def toggle_autostart(self):
         try:
@@ -625,6 +1398,7 @@ class App:
     def quit(self):
         self.stop_slideshow()
         self.stop_widget()
+        self.stop_context()
         if self.tray_icon:
             self.tray_icon.stop()
         self.root.destroy()
@@ -637,6 +1411,8 @@ def main():
     if restore:
         if app.cfg.get("mode") == "widget":
             root.after(500, app.start_widget)
+        elif app.cfg.get("mode") == "context":
+            root.after(500, app.start_context)
         else:
             threading.Thread(
                 target=restore_state, args=(app.cfg, app.slideshow), daemon=True
